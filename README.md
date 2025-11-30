@@ -76,25 +76,6 @@ accelerate launch eval.py \
     --batch_size 4
 ```
 
-## Generation Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `block_size` | 32 | Number of tokens generated per block |
-| `small_block_size` | 8 | Refinement block size for iterative unmasking |
-| `threshold` | 0.9 | Confidence threshold for unmasking tokens (0.5-1.0) |
-| `max_new_tokens` | 2048 | Maximum number of tokens to generate |
-| `temperature` | 1.0 | Sampling temperature |
-| `top_p` | 1.0 | Nucleus sampling parameter |
-| `use_block_cache` | False | Enable KV cache optimization |
-
-## Supported Benchmarks
-
-The evaluation harness supports various benchmarks including:
-
-- **Math Reasoning**: GSM8K, MATH, HRM8K
-- **Instruction Following**: IFEval
-- **Language Understanding**: KoBEST (Korean), and other lm-eval tasks
 
 Example evaluation commands are provided in `trida/eval_script.sh`.
 
