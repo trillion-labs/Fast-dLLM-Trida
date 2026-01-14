@@ -294,7 +294,12 @@ class Fast_dLLM_TridaEvalHarness(LM):
             batched_input_ids = [torch.cat([input_ids, torch.full((1, max_len - input_ids.shape[1]), self.mask_id, dtype=torch.long, device=self.device)], dim=1) for input_ids in batched_input_ids]
             batched_input_ids = torch.cat(batched_input_ids, dim=0)
             batched_input_ids = batched_input_ids.to(self.device)
-            
+
+            # Extract stop strings from the first request (all requests in batch should have same stop strings)
+            first_req = batch[0][1]
+            gen_kwargs = first_req.args[1] if len(first_req.args) > 1 else {}
+            stop_strings = gen_kwargs.get('until', [])
+
             with torch.no_grad():
                 if self.accelerator is not None:
                     generated_ids = self.accelerator.unwrap_model(self.model).mdm_sample(
@@ -309,6 +314,7 @@ class Fast_dLLM_TridaEvalHarness(LM):
                         use_block_cache=self.use_block_cache,
                         threshold=self.threshold,
                         stop_token=self.stop_token,
+                        stop_strings=stop_strings,
                     )
                 else:
                     generated_ids = self.model.mdm_sample(
@@ -323,6 +329,7 @@ class Fast_dLLM_TridaEvalHarness(LM):
                         use_block_cache=self.use_block_cache,
                         threshold=self.threshold,
                         stop_token=self.stop_token,
+                        stop_strings=stop_strings,
                     )
             
             # extract new generated tokens, and keep original index order
@@ -349,6 +356,14 @@ class Fast_dLLM_TridaEvalHarness(LM):
                     generated_tokens,
                     skip_special_tokens=True
                 )
+
+                # Apply stop words (until) from the request as post-processing
+                gen_kwargs = req.args[1] if len(req.args) > 1 else {}
+                until = gen_kwargs.get('until', [])
+                if until:
+                    for stop_word in until:
+                        if stop_word and stop_word in generated_answer:
+                            generated_answer = generated_answer.split(stop_word)[0]
 
                 # count token number
                 if self.show_speed:

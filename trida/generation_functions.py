@@ -1,4 +1,4 @@
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, List
 import torch
 import types
 from transformers.utils import logging
@@ -11,6 +11,45 @@ TRIDA_STOP_TOKEN = 128001  # <|im_end|> token
 
 MASK_COLOR = 0.5
 TOKEN_COLOR = -0.5
+
+
+def check_stop_strings(generated_tokens, prompt_len, tokenizer, stop_strings, mask_id):
+    """
+    Check if any stop string appears in the generated text for each sample in the batch.
+
+    Args:
+        generated_tokens: Tensor of shape [batch_size, seq_len] containing generated token IDs
+        prompt_len: Tensor of shape [batch_size] with the prompt length for each sample
+        tokenizer: The tokenizer to decode tokens
+        stop_strings: List of strings to check for
+        mask_id: The mask token ID to skip
+
+    Returns:
+        Tensor of shape [batch_size] with True where a stop string was found
+    """
+    if not stop_strings:
+        return torch.zeros(generated_tokens.shape[0], dtype=torch.bool, device=generated_tokens.device)
+
+    batch_size = generated_tokens.shape[0]
+    found_stop = torch.zeros(batch_size, dtype=torch.bool, device=generated_tokens.device)
+
+    for sample_idx in range(batch_size):
+        # Get generated tokens (excluding prompt and masks)
+        sample_tokens = generated_tokens[sample_idx, prompt_len[sample_idx].item():]
+        # Filter out mask tokens
+        non_mask_tokens = sample_tokens[sample_tokens != mask_id]
+        if len(non_mask_tokens) == 0:
+            continue
+        # Decode to text
+        generated_text = tokenizer.decode(non_mask_tokens, skip_special_tokens=True)
+        # Check for stop strings
+        for stop_str in stop_strings:
+            if stop_str and stop_str in generated_text:
+                found_stop[sample_idx] = True
+                break
+
+    return found_stop
+
 
 @auto_docstring(custom_intro="Custom generation helpers for Trida.")
 class TridaForDLM:
@@ -31,12 +70,14 @@ class TridaForDLM:
         use_block_cache=False,
         top_p=0.95,
         temperature=0.0,
+        stop_strings=None,
     ):
         # Convert to tensor operations to avoid .item() for torch.compile compatibility
         seq_len_max = seq_len.max()
         num_blocks = max_new_tokens // block_size + seq_len_max.div(block_size, rounding_mode='floor')
         num_blocks = int(num_blocks) if isinstance(num_blocks, torch.Tensor) else num_blocks
         batch_size = input_ids.shape[0]
+        original_seq_len = seq_len.clone()  # Store original prompt lengths for stop string checking
 
         if min_len > block_size:
             output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
@@ -74,6 +115,7 @@ class TridaForDLM:
             x_t = x_init.clone()
             step = 0
             block_past_key_values = None
+            block_attention_mask = None  # Track attention mask within block for any-order causal
             while True:
                 mask_idx = (x_t[:, -block_size:] == mask_id)
                 if mask_idx.sum() == 0:
@@ -105,15 +147,20 @@ class TridaForDLM:
 
                         if use_block_cache:
                             if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
-                                output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
+                                output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, prev_attention_mask=block_attention_mask, mask_id=mask_id)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
+                                block_attention_mask = output.computed_attention_mask  # Track attention mask for any-order causal
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                                 logits = logits[:, start:end]
                             else:
-                                logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
+                                output = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx, prev_attention_mask=block_attention_mask, mask_id=mask_id)
+                                logits = output.logits
+                                block_attention_mask = output.computed_attention_mask  # Track attention mask for any-order causal
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                         else:
-                            logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
+                            output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, prev_attention_mask=block_attention_mask, mask_id=mask_id)
+                            logits = output.logits
+                            block_attention_mask = output.computed_attention_mask  # Track attention mask for any-order causal
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                             logits = logits[:, start:end]
                         x_1, p_1t = self.sample_with_top_p(logits, top_p=top_p, temperature=temperature)
@@ -135,7 +182,14 @@ class TridaForDLM:
 
                         step += 1
 
-            if input_ids.shape[1] ==  x_t.shape[1]:
+            # Check for stop strings at the end of each block (when block is fully decoded)
+            if stop_strings:
+                # Get the prompt lengths for current active samples
+                current_prompt_lens = original_seq_len[sample_indices] if len(sample_indices) < batch_size else original_seq_len
+                stop_string_flags = check_stop_strings(x_t, current_prompt_lens, tokenizer, stop_strings, mask_id)
+                finished_flag = finished_flag | stop_string_flags
+
+            if input_ids.shape[1] == x_t.shape[1]:
                 input_ids = x_t
             else:
                 input_ids[:, :(block_idx + 1)*block_size] = x_t[:, :-1]
@@ -237,6 +291,7 @@ class TridaForDLM:
 
             x_t = x_init.clone()
             block_past_key_values = None
+            block_attention_mask = None  # Track attention mask within block for any-order causal
             step = 0
 
             while True:
@@ -274,7 +329,9 @@ class TridaForDLM:
                             if (x_t[:, prompt_length:prompt_length+stop_token_idx] == mask_id).sum() == 0:
                                 break
 
-                        logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
+                        output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, prev_attention_mask=block_attention_mask, mask_id=mask_id)
+                        logits = output.logits
+                        block_attention_mask = output.computed_attention_mask  # Track attention mask for any-order causal
                         logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                         logits = logits[:, start:end]
 
