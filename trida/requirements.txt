@@ -8,7 +8,7 @@ torch>=2.0.1
 wandb
 deepspeed>=0.14.4
 sentencepiece
-transformers==4.53.1
+transformers==5.10.1
 cpm_kernels==1.0.11
 evaluate==0.4.0
 bitsandbytes>=0.40.0
